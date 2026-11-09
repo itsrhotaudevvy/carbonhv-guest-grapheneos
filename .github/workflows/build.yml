@@ -1,0 +1,145 @@
+name: Build the GrapheneOS-derived CVD1 guest
+
+# Runs the CarbonHV recipe (guest/android/build.sh) against the GrapheneOS manifest and publishes
+# the resulting bundle with provenance. The recipe is not duplicated here: this repository checks
+# out CarbonHV at a pinned commit, so one source of truth produces the image.
+#
+# A standard GitHub-hosted runner cannot do this (needs ~400 GB disk, >=32 GB RAM). The preflight
+# job measures the runner first and fails with the options rather than starting a six-hour build
+# that would die at 70 GB. See README.md.
+
+on:
+  workflow_dispatch:
+    inputs:
+      carbonhv_ref:
+        description: CarbonHV commit or branch whose recipe to follow
+        default: main
+      graphene_ref:
+        description: GrapheneOS manifest branch or reviewed tag
+        default: "17"
+      target:
+        description: CVD1 product to lunch
+        default: aosp_cf_arm64_phone
+      jobs:
+        description: Parallel build jobs
+        default: "8"
+      publish_tag:
+        description: Publish as a release with this tag (empty = artifact only)
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  preflight:
+    runs-on: ${{ fromJSON(vars.CARBONHV_BUILDER_LABEL || '["ubuntu-24.04"]') }}
+    outputs:
+      sufficient: ${{ steps.check.outcome == 'success' }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Measure the runner
+        id: check
+        run: ci/preflight.sh 400 32 8
+
+  build:
+    needs: preflight
+    if: needs.preflight.outputs.sufficient == 'true'
+    runs-on: ${{ fromJSON(vars.CARBONHV_BUILDER_LABEL || '["ubuntu-24.04"]') }}
+    timeout-minutes: 480
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Check out the CarbonHV recipe at a pinned commit
+        uses: actions/checkout@v5
+        with:
+          repository: itsrhotaudevvy/CarbonHV
+          ref: ${{ inputs.carbonhv_ref }}
+          path: carbonhv
+          fetch-depth: 1
+
+      - name: Install repo and build prerequisites
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/bin"
+          curl --fail --location --output "$HOME/bin/repo" \
+            https://storage.googleapis.com/git-repo-downloads/repo
+          chmod +x "$HOME/bin/repo"
+          echo "$HOME/bin" >>"$GITHUB_PATH"
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache curl flex g++-multilib gcc-multilib git \
+            gnupg imagemagick lib32readline-dev lib32z1-dev libelf-dev liblz4-tool \
+            libssl-dev libxml2 libxml2-utils lzop pngcrush rsync schedtool squashfs-tools \
+            xsltproc zip zlib1g-dev python3 unzip
+
+      - name: Pin the CarbonHV commit in the log
+        run: |
+          set -euo pipefail
+          git -C carbonhv rev-parse HEAD | tee carbonhv-commit.txt
+          [[ "${GITHUB_REF_PROTECTED:-}" == "true" || -n "${{ inputs.publish_tag }}" ]] || \
+            echo "note: building from $(cat carbonhv-commit.txt); pass publish_tag to keep the result"
+
+      - name: Build the guest
+        env:
+          CARBON_GRAPHENE_REF: ${{ inputs.graphene_ref }}
+          CARBON_GRAPHENE_TARGET: ${{ inputs.target }}
+          CARBON_BUILD_JOBS: ${{ inputs.jobs }}
+          CARBON_GRAPHENE_SOURCE: ${{ github.workspace }}/grapheneos
+          CARBON_GRAPHENE_OUTPUT: ${{ github.workspace }}/out/carbonhv/grapheneos
+          # The prebuilt GKI config is what the CVD1 kernel contract is checked against; without it
+          # build.sh warns that release automation must supply it.
+          CARBON_GRAPHENE_KERNEL_CONFIG: ${{ vars.CARBON_GRAPHENE_KERNEL_CONFIG }}
+        run: |
+          set -euo pipefail
+          cargo install --locked --path carbonhv/crates/carbon-cli --root "$HOME/.local" \
+            || cargo build --release --manifest-path carbonhv/crates/carbon-cli/Cargo.toml
+          export CARBONCTL="$HOME/.local/bin/carbonctl"
+          if [[ ! -x "$CARBONCTL" ]]; then
+            export CARBONCTL="$PWD/carbonhv/target/release/carbonctl"
+          fi
+          carbonhv/guest/android/build.sh
+
+      - name: Fail if the kernel contract was not verified
+        run: |
+          set -euo pipefail
+          if [[ ! -f out/carbonhv/grapheneos/kernel.config ]]; then
+            echo "no kernel.config in the output: set CARBON_GRAPHENE_KERNEL_CONFIG so the CVD1" >&2
+            echo "kernel contract is actually checked before this image is published" >&2
+            exit 6
+          fi
+
+      - name: Write provenance
+        run: |
+          set -euo pipefail
+          out=out/carbonhv/grapheneos
+          {
+            echo "built_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "carbonhv_commit=$(cat carbonhv-commit.txt)"
+            echo "graphene_ref=${{ inputs.graphene_ref }}"
+            echo "target=${{ inputs.target }}"
+            echo "jobs=${{ inputs.jobs }}"
+            echo "runner=${{ runner.name }} ${{ runner.os }} $(nproc) cpus $(awk '/MemTotal/ {printf "%d GiB", $2/1024/1024}' /proc/meminfo)"
+            echo "kernel_config_verified=$([[ -f $out/kernel.config ]] && echo yes || echo no)"
+            echo "identity=CarbonHV-maintained GrapheneOS-derived virtual-device build; not an official GrapheneOS target"
+            echo "workflow_run=${{ github.run_id }}"
+          } >"$out/provenance.txt"
+          cat "$out/provenance.txt"
+          ( cd "$out" && sha256sum boot.img system.img >SHA256SUMS && cat SHA256SUMS )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: carbonhv-guest-grapheneos-cvd1
+          path: out/carbonhv/grapheneos/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish release
+        if: ${{ inputs.publish_tag != '' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.publish_tag }}"
+          gh release create "$tag" out/carbonhv/grapheneos --title "$tag" \
+            --notes "CarbonHV-maintained GrapheneOS-derived CVD1 guest. Not an official GrapheneOS device target; see provenance.txt." \
+            || gh release upload "$tag" out/carbonhv/grapheneos --clobber
